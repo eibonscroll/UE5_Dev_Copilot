@@ -1,0 +1,7 @@
+fastapi
+uvicorn[standard]
+pydantic
+qdrant-client
+sentence-transformers
+langchain-text-splitters
+tiktoken

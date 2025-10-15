@@ -3,6 +3,26 @@ __pycache__/
 *.py[codz]
 *$py.class
 
+# ---- Agentic Copilot data (keep folders, ignore contents) ----
+# Ignore everything under data/
+agentic-copilot/data/**
+
+# But keep the directories themselves
+!agentic-copilot/data/**/
+
+# Allow placeholder files so empty dirs can be tracked
+agentic-copilot/data/plugins/.gitkeep
+agentic-copilot/data/project/.gitkeep
+agentic-copilot/data/unreal_docs/.gitkeep
+
+# IDE / editors
+.idea/
+.vscode/
+
+# OS cruft
+.DS_Store
+Thumbs.db
+
 # C extensions
 *.so
 
