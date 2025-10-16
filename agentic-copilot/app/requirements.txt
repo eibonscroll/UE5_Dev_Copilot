@@ -5,4 +5,5 @@ pydantic-settings>=2
 qdrant-client
 sentence-transformers
 langchain-text-splitters
-tiktoken
+openai>=1.44.0
+tiktoken>=0.7.0

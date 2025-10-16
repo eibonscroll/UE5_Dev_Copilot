@@ -22,6 +22,7 @@ services:
       - ./data/unreal_docs:/ingest/unreal_docs:ro
       - ./data/project:/ingest/project:ro
       - ./data/plugins:/ingest/plugins:ro
+      - ./out:/app/out
       # cache model downloads between runs (big speedup after first pull)
       - hf_cache:/root/.cache/huggingface
       # - torch_cache:/root/.cache/torch     # uncomment if you see torch downloads

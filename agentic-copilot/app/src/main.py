@@ -8,10 +8,15 @@ from .vectordb import VectorDB
 from .indexer import index_all
 from .agents import input_gate, rag_query, responder, formatter
 from pathlib import Path
-
+from src.agents.pipeline import run_pipeline
 import os, time, logging, asyncio
 from fastapi import FastAPI, BackgroundTasks, HTTPException, Header
 from typing import Optional
+from fastapi import HTTPException
+from fastapi.responses import FileResponse
+
+
+OUT_DIR = Path("/app/out")  # same dir used by write_markdown()
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
@@ -71,29 +76,15 @@ def startup():
     logger.info("startup: indexing done files=%s chunks=%s in %ss",
                 stats.get("files"), stats.get("chunks"), stats.get("elapsed_s"))
     logger.info("startup: finished in %.1fs", time.perf_counter() - t0)
+
 @app.post("/ask")
 def ask(q: Ask):
-    data = rag_query.handle(q.prompt, EMB, VDB)
-    # Make a short markdown answer: references + snippets
-    lines = [f"### Top references for: `{q.prompt}`", ""]
-    if not data["results"]:
-        lines.append("_No results found._")
-    else:
-        for i, r in enumerate(data["results"], 1):
-            path = r["path"] or "(unknown file)"
-            sc = f"{r['score']:.3f}"
-            rc = f"{r['rerank']:.3f}" if r.get("rerank") is not None else "n/a"
-            src = r["source"] or "unknown"
-            lines.append(f"**{i}. {path}**  \n_source: {src}_  \ncos={sc}, rerank={rc}")
-            lines.append("")
-            lines.append("> " + r["snippet"])
-            lines.append("")
-
-    md = "\n".join(lines)
-    return {
-        "decision": "YES",
-        "markdown": md,
-    }
+    try:
+        result = run_pipeline(q.prompt, EMB, VDB)
+        return result
+    except Exception as e:
+        logger.exception("/ask failed: %s", e)
+        return {"decision":"NO", "message": str(e)}
 
 @app.post("/ingest")
 def ingest(background: BackgroundTasks):
@@ -101,6 +92,16 @@ def ingest(background: BackgroundTasks):
                         Path("/ingest/plugins"), EMB, VDB,
                         logging.getLogger("indexer"), 100, 1000)
     return {"status": "started"}
+
+@app.get("/download/{name}")
+def download_md(name: str):
+    # block path traversal
+    if "/" in name or "\\" in name:
+        raise HTTPException(status_code=400, detail="Invalid filename")
+    path = OUT_DIR / name
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="File not found")
+    return FileResponse(str(path), media_type="text/markdown", filename=name)
 
 @app.get("/", response_class=HTMLResponse)
 def ui():
@@ -138,6 +139,10 @@ def ui():
     <textarea id="prompt" placeholder="e.g., Where does PlayerController spawn the companion actor?"></textarea><br/>
     <div class="row">
       <button id="ask">Ask</button>
+      <!-- NEW: download -->
+      <button id="downloadBtn" disabled title="Download last answer as .md">Download .md</button>
+      <span id="dlInfo" class="muted"></span>
+      <!-- /NEW -->
       <span id="msg" class="muted"></span>
     </div>
     <div id="out"></div>
@@ -168,12 +173,27 @@ def ui():
   const promptEl = document.getElementById('prompt');
   const out = document.getElementById('out');
   const msg = document.getElementById('msg');
+  // NEW: download controls
+  const downloadBtn = document.getElementById('downloadBtn');
+  const dlInfo = document.getElementById('dlInfo');
+  let lastFileName = null; // just the basename
+  // /NEW
+
+  function basename(p) {
+    if (!p) return "";
+    return p.split('/').pop().split('\\').pop();
+  }
 
   askBtn.onclick = async () => {
     const q = (promptEl.value || "").trim();
     if (!q) { msg.textContent = "Enter a prompt."; return; }
     msg.textContent = "Running…";
     out.innerHTML = "";
+    // reset download UI
+    lastFileName = null;
+    downloadBtn.disabled = true;
+    dlInfo.textContent = "";
+
     try {
       const r = await fetch('/ask', {
         method: 'POST',
@@ -205,11 +225,30 @@ def ui():
         parent.replaceWith(container);
       }
       await mermaid.run({ querySelector: '.mermaid' });
+
+      // NEW: enable download if server returned a file path
+      if (data.file) {
+        lastFileName = basename(data.file);
+        if (lastFileName) {
+          downloadBtn.disabled = false;
+          dlInfo.textContent = "Ready: " + lastFileName;
+        }
+      }
+      // /NEW
     } catch (e) {
       console.error(e);
       msg.textContent = "Error: " + e.message;
     }
   };
+
+  // NEW: download click handler
+  downloadBtn.onclick = () => {
+    if (!lastFileName) return;
+    const url = '/download/' + encodeURIComponent(lastFileName);
+    // trigger browser download
+    window.location.href = url;
+  };
+  // /NEW
 
   // ---------- Admin: Reindex ----------
   const tokenInput = document.getElementById('token');
@@ -240,7 +279,6 @@ def ui():
       const j = await r.json();
       statusPre.textContent = JSON.stringify(j, null, 2);
 
-      // Control button states
       if (j.running) {
         reindexBtn.disabled = true;
         reindexBtn.textContent = "Reindex (running…)";
@@ -251,7 +289,6 @@ def ui():
         if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
       }
 
-      // Show quick hint
       if (j.last_error) {
         reindexMsg.textContent = "Last error: " + j.last_error;
         reindexMsg.className = "err";
@@ -281,7 +318,6 @@ def ui():
         throw new Error("HTTP " + r.status + ": " + t);
       }
       reindexMsg.textContent = "Reindex started.";
-      // start polling
       fetchStatus();
     } catch (e) {
       reindexMsg.textContent = "Start failed: " + e.message;
@@ -293,8 +329,6 @@ def ui():
 
   reindexBtn.onclick = triggerReindex;
   refreshStatusBtn.onclick = fetchStatus;
-
-  // initial status fetch on load
   fetchStatus();
   </script>
 </body>
