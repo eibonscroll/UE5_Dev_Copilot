@@ -23,6 +23,18 @@ agentic-copilot/data/unreal_docs/.gitkeep
 .DS_Store
 Thumbs.db
 
+#To keep secrets, api keys etc out of git
+# env files
+agentic-copilot/.env
+agentic-copilot/.env.*
+!agentic-copilot/.env.example
+
+# local overrides
+*.local.json
+*.local.yaml
+config/**.local.*
+
+
 # C extensions
 *.so
 
