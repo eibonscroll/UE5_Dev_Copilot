@@ -1,42 +1,38 @@
 # src/agents/langchain_orchestrator.py
 from __future__ import annotations
-import os, logging, time, hashlib, uuid, pathlib
+import os, logging, time, hashlib, pathlib
 from typing import List, Dict, Any, Callable
 
 from pydantic import BaseModel
 from src.settings import SETTINGS
 
-# --- LangChain core ---
+# LangChain core
 from langchain_core.tools import tool
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain_core.runnables import RunnableConfig
 from langchain_core.output_parsers import StrOutputParser
 
-# --- LLM (optional) ---
+# LLM
 from langchain_openai import ChatOpenAI
 
-# --- Vector store / embeddings ---
+# Vector / embeddings
 from langchain_community.vectorstores import Qdrant as LCQdrant
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from qdrant_client import QdrantClient
 
-# --- New: Inventory agent (filesystem-based) ---
-from src.agents.inventory_agent import run as run_inventory_agent  # <- add this file if not present
+# Existing Inventory agent
+from src.agents.inventory_agent import run as run_inventory_agent
+
+# NEW: ElaboratorAgent
+from src.agents.elaborator_agent import ElaboratorAgent, ElaboratorConfig
 
 log = logging.getLogger("orchestrator")
 
 
-# --------------------
-# File helpers
-# --------------------
+# ---------- helpers ----------
 def _write_md(markdown: str, out_dir: str = "/app/out", stem: str = "") -> str:
-    """
-    Writes markdown to /app/out/answer-<stem or runid>.md (if non-empty) and
-    returns the FILESYSTEM path. Callers can convert to /download/<name>.
-    """
     os.makedirs(out_dir, exist_ok=True)
     if not markdown or not markdown.strip():
-        return ""  # don't write empty files
+        return ""
     run_id = stem or hashlib.sha1(str(time.time()).encode()).hexdigest()[:8]
     path = os.path.join(out_dir, f"answer-{run_id}.md")
     with open(path, "w", encoding="utf-8") as f:
@@ -44,9 +40,6 @@ def _write_md(markdown: str, out_dir: str = "/app/out", stem: str = "") -> str:
     return path
 
 
-# --------------------
-# Prompting / LLM glue
-# --------------------
 def _make_prompt(query: str, refs: List[Dict[str, Any]]) -> str:
     numbered = []
     for i, r in enumerate(refs, 1):
@@ -62,63 +55,68 @@ def _make_prompt(query: str, refs: List[Dict[str, Any]]) -> str:
     )
 
 
-def generate_answer(query: str, contexts: List[Dict[str, Any]]) -> str:
-    """Return a plain markdown string (never None)."""
-    model = os.getenv("OPENAI_CHAT_MODEL", "gpt-4.1-mini")
-    temperature = float(os.getenv("OPENAI_TEMPERATURE", "0.2"))
+def _llm(model_env="OPENAI_CHAT_MODEL", temp_env="OPENAI_TEMPERATURE", default_model="gpt-4.1-mini", default_temp=0.2):
+    model = os.getenv(model_env, default_model)
+    temperature = float(os.getenv(temp_env, str(default_temp)))
+    return ChatOpenAI(model=model, temperature=temperature, timeout=60)
 
-    llm = ChatOpenAI(model=model, temperature=temperature)
+
+def generate_answer(query: str, contexts: List[Dict[str, Any]]) -> str:
+    llm = _llm()
     prompt = ChatPromptTemplate.from_messages([
         ("system", "Return clean, concise Markdown. Include citations [^n]."),
         ("user", "{user_input}"),
     ])
-    chain = prompt | llm | StrOutputParser()  # <- guarantees a str
-
+    chain = prompt | llm | StrOutputParser()
     user_input = _make_prompt(query, contexts)
     md = chain.invoke({"user_input": user_input}) or ""
     return md.strip()
 
 
-# ----------------------------
-# Embeddings + Retriever glue
-# ----------------------------
+# ---------- retriever ----------
 def _embedding_fn(model_name: str):
-    # Keep it consistent with your index (BAAI/bge-small-en, dim=384)
     return HuggingFaceEmbeddings(model_name=model_name, encode_kwargs={"normalize_embeddings": True})
 
-
 def _make_retriever() -> Any:
+    # prefer the new packages if you upgrade later, but this works with current deps
     emb = _embedding_fn(SETTINGS.embedding_model)
-    client = QdrantClient(url=SETTINGS.qdrant_url, prefer_grpc=True, grpc_port=6334, timeout=60.0)
+    client = QdrantClient(
+        url=SETTINGS.qdrant_url,
+        prefer_grpc=True,
+        grpc_port=6334,
+        timeout=60.0,
+    )
+
+    # 👇 tell LC Qdrant which payload field is the content
     vs = LCQdrant(
         client=client,
         collection_name=SETTINGS.collection,
         embeddings=emb,
+        content_payload_key="text",        # <— your chunks live here
+        metadata_payload_key=None,         # keep full payload in metadata (optional)
     )
-    # k is adjusted at call-time; here provide a sane default
+
     retriever = vs.as_retriever(search_kwargs={"k": 8})
     return retriever
 
 
-# --------------------------------
-# Tools the agent can call
-# --------------------------------
+# ---------- tools ----------
 class SearchArgs(BaseModel):
     query: str
     k: int = 8
 
-
 @tool("search_docs", args_schema=SearchArgs)
 def search_docs(query: str, k: int = 8) -> List[Dict[str, Any]]:
     """
-    Search the indexed docs/code in Qdrant and return the top-k results.
-    ALWAYS call this before answering. Cite the 'source' and 'path' in the answer.
+    Search the indexed Unreal docs/code in Qdrant and return the top-k results.
+    Always call this before answering. Each result includes:
+      - page_content: the text chunk
+      - path/source: a path or module/file hint you can cite in the answer
     """
     retriever = _make_retriever()
     docs = retriever.get_relevant_documents(query, search_kwargs={"k": k})
     out = []
     for d in docs:
-        # d.metadata may contain path/source; your index used 'file','path','source','text'
         meta = dict(d.metadata or {})
         out.append({
             "page_content": d.page_content,
@@ -127,28 +125,24 @@ def search_docs(query: str, k: int = 8) -> List[Dict[str, Any]]:
         })
     return out
 
-
 class MermaidArgs(BaseModel):
     spec: str
-
 
 @tool("make_mermaid", args_schema=MermaidArgs)
 def make_mermaid(spec: str) -> str:
     """
-    Validate and return a Mermaid diagram block. Pass only the inner mermaid spec (no backticks).
+    Validate and wrap a Mermaid diagram spec in a fenced code block.
+    Pass only the inner Mermaid definition (no backticks).
+    Returns a Markdown string containing a ```mermaid fenced block.
     """
     spec = spec.strip()
     if not spec:
         return "No diagram content."
-    # Minimal guard: cap length
     if len(spec) > 8000:
-        spec = spec[:8000] + "\n%% truncated"
+        spec = spec[:8000] + "\n\n%% truncated"
     return f"```mermaid\n{spec}\n```"
 
-
-# --------------------------------
-# System prompt for the agent
-# --------------------------------
+# ---------- agent graph ----------
 SYSTEM = """You are a helpful Unreal Engine code/doc assistant.
 CRITICAL RULES:
 - Ground your answers ONLY on retrieved context from the `search_docs` tool.
@@ -158,69 +152,49 @@ CRITICAL RULES:
 - Prefer concise, stepwise, actionable answers; include filenames and symbols when relevant.
 """
 
-
 def _llm_or_none():
     if SETTINGS.has_openai_key:
-        # Default to small fast model; user can override via env OPENAI_CHAT_MODEL
-        model = os.getenv("OPENAI_CHAT_MODEL", "gpt-4.1-mini")
-        temperature = float(os.getenv("OPENAI_TEMPERATURE", "0.1"))
-        return ChatOpenAI(model=model, temperature=temperature, timeout=60)
+        return _llm(default_temp=0.1)
     return None
 
-
 def _agent_graph():
-    """Return either a tool-calling LLM agent or a simple retrieval chain fallback."""
     llm = _llm_or_none()
     tools = [search_docs, make_mermaid]
-
     if llm is not None:
         llm = llm.bind_tools(tools)
-
         prompt = ChatPromptTemplate.from_messages(
-            [
-                ("system", SYSTEM),
-                MessagesPlaceholder("messages"),  # we'll inject [("human", query)]
-            ]
+            [("system", SYSTEM), MessagesPlaceholder("messages")]
         )
         chain = prompt | llm
         return chain, tools
 
-    # ------- No-LLM fallback (still grounded & useful) -------
+    # no-LLM fallback (unused in current flow but kept for completeness)
     def fallback_run(query: str) -> str:
         hits = search_docs.invoke({"query": query, "k": 8})  # type: ignore
         if not hits:
             return "I couldn't find anything relevant in the index for that query."
-        md = ["### Answer (no LLM mode)\n"]
-        md.append("_Top matches:_\n")
+        md = ["### Answer (no LLM mode)\n", "_Top matches:_\n"]
         for h in hits[:8]:
             src = h.get("path") or h.get("source") or "unknown"
             md.append(f"- ({src})")
-        md.append("\n---\n")
-        md.append("**Context excerpts:**\n")
-        for h in hits[:6]:
-            src = h.get("path") or h.get("source") or "unknown"
-            snippet = (h["page_content"] or "").strip()
-            if len(snippet) > 600:
-                snippet = snippet[:600] + " …"
-            md.append(f"**{src}**\n\n> {snippet}\n")
         return "\n".join(md)
-
     return fallback_run, tools
 
 
-# --------------------------------
-# Intent detection + routing
-# --------------------------------
+# ---------- intent ----------
 def _detect_intent(q: str) -> str:
     ql = q.lower()
-    if "plugin" in ql and any(w in ql for w in ["name", "names", "list", "what are", "which"]):
+    if "plugin" in ql and any(w in ql for w in ["name", "names", "list", "which", "what are"]):
         return "list_plugins"
-    return "rag"  # default: generic RAG answer
+    return "rag"
 
 
-# --------------------------------
-# Public entrypoint
-# --------------------------------
+# ---------- public orchestrator ----------
+def _append_refs(md: str, ctxs: List[Dict[str, Any]]) -> str:
+    refs = "\n".join([f"[^{i}] {c.get('path') or c.get('file') or ''}"
+                      for i, c in enumerate(ctxs, 1)])
+    return md + ("\n\n---\n**References**\n\n" + refs if refs.strip() else "")
+
 def run_langchain_pipeline(
     query: str,
     retrieve_fn: Callable[[str, int, int], List[Dict[str, Any]]],
@@ -228,9 +202,10 @@ def run_langchain_pipeline(
     top_n: int = 8,
 ) -> Dict[str, Any]:
     """
-    Orchestrates multiple agents:
-      - InventoryAgent for inventory questions (e.g., 'list plugins')
-      - RAG Agent (your existing retrieve -> synthesize -> package)
+    Pipeline:
+      - Intent detect (+ InventoryAgent for list-style intents)
+      - RAG (retrieve_fn -> synthesize)
+      - ElaboratorAgent for grounded “what these do”
     """
     t0 = time.perf_counter()
     run_id = hashlib.sha1(f"{time.time()}-{query}".encode()).hexdigest()[:8]
@@ -239,47 +214,136 @@ def run_langchain_pipeline(
         intent = _detect_intent(query)
         log.info("orchestrator: intent=%s run_id=%s", intent, run_id)
 
-        # ---------- Inventory route ----------
+        # -------------------------------
+        # Helper: extract items to expand
+        # -------------------------------
+        def _extract_items_from_markdown(md: str) -> list[str]:
+            items: list[str] = []
+            for line in (md or "").splitlines():
+                if line.strip().startswith(("-", "*", "•")):
+                    name = line.lstrip("-*• \t").strip()
+                    # keep short/simple names only (single token plugin/module names)
+                    if 2 <= len(name) <= 64 and " " not in name:
+                        items.append(name)
+            # de-dup preserving order
+            return list(dict.fromkeys(items))
+
+        def _extract_items_from_contexts(ctxs: List[Dict[str, Any]]) -> list[str]:
+            # fall back to plugin folder names under /plugins/<NAME>/...
+            possible: list[str] = []
+            for c in ctxs:
+                p = (c.get("path") or c.get("file") or "") or ""
+                if "/plugins/" in p:
+                    try:
+                        parts = p.split("/plugins/")[1].split("/")
+                        if parts and parts[0]:
+                            possible.append(parts[0])
+                    except Exception:
+                        pass
+            return list(dict.fromkeys(possible))
+
+        # --------------------------------
+        # Inventory route (list_plugins)
+        # --------------------------------
         if intent == "list_plugins":
             inv = run_inventory_agent(query)
-            md = inv.get("markdown", "") or "_No plugins found._"
-            # Package and return a downloadable URL
-            fs_path = _write_md(md, stem=f"answer-{run_id}")
+            base_md = inv.get("markdown", "") or "_No plugins found._"
+
+            # detect items for elaboration
+            items = _extract_items_from_markdown(base_md)
+            if not items:
+                # try a direct scan using retriever too (optional)
+                retriever = _make_retriever()
+                # probe some results to harvest names from paths
+                docs = retriever.get_relevant_documents("list of plugins", search_kwargs={"k": 12})
+                for d in docs:
+                    p = (d.metadata or {}).get("path") or (d.metadata or {}).get("file") or ""
+                    if "/plugins/" in p:
+                        try:
+                            parts = p.split("/plugins/")[1].split("/")
+                            if parts and parts[0]:
+                                items.append(parts[0])
+                        except Exception:
+                            pass
+                items = list(dict.fromkeys(items))
+
+            # Elaborate (plugins)
+            try:
+                retriever = _make_retriever()
+                from src.agents.elaborator_agent import ElaboratorAgent, ElaboratorConfig
+                elab_cfg = ElaboratorConfig(
+                    model=os.getenv("OPENAI_CHAT_MODEL", "gpt-4.1-mini"),
+                    temperature=float(os.getenv("OPENAI_TEMPERATURE", "0.2")),
+                    per_item_k=int(os.getenv("ELABORATOR_PER_ITEM_K", "8")),
+                )
+                elaborator = ElaboratorAgent(retriever=retriever, cfg=elab_cfg)
+                if items:
+                    elaboration = elaborator.elaborate(base_md, item_label="plugin", items=items)
+                else:
+                    elaboration = ""
+
+                md_out = base_md + ("\n\n" + elaboration if elaboration else "")
+            except Exception as e:
+                log.exception("elaborator failed (inventory): %s", e)
+                md_out = base_md + "\n\n> _(Elaboration step failed; base answer shown.)_"
+
+            fs_path = _write_md(md_out, stem=f"answer-{run_id}")
             file_url = f"/download/{os.path.basename(fs_path)}" if fs_path else ""
-            inv["file"] = file_url
             log.info("orchestrator: inventory ok run_id=%s duration=%.3fs",
                      run_id, time.perf_counter() - t0)
-            return inv
+            return {"decision": "YES", "markdown": md_out, "file": file_url}
 
-        # ---------- Default RAG route ----------
-        ctxs = retrieve_fn(query, k=k, top_n=top_n)  # your adapter maps VDB hits -> {path,text,score}
+        # ----------------
+        # Default RAG flow
+        # ----------------
+        ctxs = retrieve_fn(query, k=k, top_n=top_n)
         if not ctxs:
             md = "_No relevant results._"
             fs_path = _write_md(md, stem=f"answer-{run_id}")
             file_url = f"/download/{os.path.basename(fs_path)}" if fs_path else ""
             return {"decision": "YES", "markdown": md, "file": file_url}
 
-        md = generate_answer(query, ctxs)
-        if not md:
+        base_md = generate_answer(query, ctxs)
+        if not base_md:
             log.warning("Empty LLM output for query=%r", query)
-            return {
-                "decision": "NO",
-                "message": "LLM returned an empty response. Try rephrasing or check logs.",
-                "markdown": "",
-                "file": ""
-            }
+            return {"decision": "NO", "message": "LLM returned empty response.", "markdown": "", "file": ""}
 
-        # Append simple references section
-        refs = "\n".join([f"[^{i}] {c.get('path') or c.get('file') or ''}"
-                          for i, c in enumerate(ctxs, 1)])
-        md_out = md + ("\n\n---\n**References**\n\n" + refs if refs.strip() else "")
+        # ---- Elaborate based on items detected ----
+        items = _extract_items_from_markdown(base_md)
+        if not items:
+            items = _extract_items_from_contexts(ctxs)
 
+        try:
+            retriever = _make_retriever()
+            from src.agents.elaborator_agent import ElaboratorAgent, ElaboratorConfig
+            elab_cfg = ElaboratorConfig(
+                model=os.getenv("OPENAI_CHAT_MODEL", "gpt-4.1-mini"),
+                temperature=float(os.getenv("OPENAI_TEMPERATURE", "0.2")),
+                per_item_k=int(os.getenv("ELABORATOR_PER_ITEM_K", "8")),
+            )
+            elaborator = ElaboratorAgent(retriever=retriever, cfg=elab_cfg)
+
+            lower_q = query.lower()
+            item_label = "plugin" if "plugin" in lower_q else ("module" if "module" in lower_q else "item")
+            if items:
+                elaboration = elaborator.elaborate(base_md, item_label=item_label, items=items)
+            else:
+                elaboration = ""
+            md_out = base_md + ("\n\n" + elaboration if elaboration else "")
+        except Exception as e:
+            log.exception("elaborator failed (rag): %s", e)
+            md_out = base_md + "\n\n> _(Elaboration step failed; base answer shown.)_"
+
+        # Append references & write file
+        md_out = _append_refs(md_out, ctxs)
         fs_path = _write_md(md_out, stem=f"answer-{run_id}")
         file_url = f"/download/{os.path.basename(fs_path)}" if fs_path else ""
 
-        dt = time.perf_counter() - t0
-        log.info("orchestrator: ok run_id=%s duration=%.3fs", os.path.basename(fs_path).replace(".md","") if fs_path else "-", dt)
-
+        log.info(
+            "orchestrator: ok run_id=%s duration=%.3fs",
+            os.path.basename(fs_path).replace(".md", "") if fs_path else "-",
+            time.perf_counter() - t0,
+        )
         return {"decision": "YES", "markdown": md_out, "file": file_url}
 
     except Exception as e:
