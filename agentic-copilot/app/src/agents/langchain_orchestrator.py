@@ -1,10 +1,9 @@
 # src/agents/langchain_orchestrator.py
 from __future__ import annotations
-import os, logging, time, hashlib , uuid, pathlib
-from typing import List, Dict, Any
+import os, logging, time, hashlib, uuid, pathlib
+from typing import List, Dict, Any, Callable
 
 from pydantic import BaseModel
-
 from src.settings import SETTINGS
 
 # --- LangChain core ---
@@ -21,10 +20,20 @@ from langchain_community.vectorstores import Qdrant as LCQdrant
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from qdrant_client import QdrantClient
 
+# --- New: Inventory agent (filesystem-based) ---
+from src.agents.inventory_agent import run as run_inventory_agent  # <- add this file if not present
+
 log = logging.getLogger("orchestrator")
 
 
+# --------------------
+# File helpers
+# --------------------
 def _write_md(markdown: str, out_dir: str = "/app/out", stem: str = "") -> str:
+    """
+    Writes markdown to /app/out/answer-<stem or runid>.md (if non-empty) and
+    returns the FILESYSTEM path. Callers can convert to /download/<name>.
+    """
     os.makedirs(out_dir, exist_ok=True)
     if not markdown or not markdown.strip():
         return ""  # don't write empty files
@@ -34,6 +43,10 @@ def _write_md(markdown: str, out_dir: str = "/app/out", stem: str = "") -> str:
         f.write(markdown)
     return path
 
+
+# --------------------
+# Prompting / LLM glue
+# --------------------
 def _make_prompt(query: str, refs: List[Dict[str, Any]]) -> str:
     numbered = []
     for i, r in enumerate(refs, 1):
@@ -47,6 +60,7 @@ def _make_prompt(query: str, refs: List[Dict[str, Any]]) -> str:
         f"QUESTION:\n{query}\n\n"
         "CONTEXT:\n" + "\n\n".join(numbered)
     )
+
 
 def generate_answer(query: str, contexts: List[Dict[str, Any]]) -> str:
     """Return a plain markdown string (never None)."""
@@ -72,6 +86,7 @@ def _embedding_fn(model_name: str):
     # Keep it consistent with your index (BAAI/bge-small-en, dim=384)
     return HuggingFaceEmbeddings(model_name=model_name, encode_kwargs={"normalize_embeddings": True})
 
+
 def _make_retriever() -> Any:
     emb = _embedding_fn(SETTINGS.embedding_model)
     client = QdrantClient(url=SETTINGS.qdrant_url, prefer_grpc=True, grpc_port=6334, timeout=60.0)
@@ -84,12 +99,14 @@ def _make_retriever() -> Any:
     retriever = vs.as_retriever(search_kwargs={"k": 8})
     return retriever
 
+
 # --------------------------------
 # Tools the agent can call
 # --------------------------------
 class SearchArgs(BaseModel):
     query: str
     k: int = 8
+
 
 @tool("search_docs", args_schema=SearchArgs)
 def search_docs(query: str, k: int = 8) -> List[Dict[str, Any]]:
@@ -110,8 +127,10 @@ def search_docs(query: str, k: int = 8) -> List[Dict[str, Any]]:
         })
     return out
 
+
 class MermaidArgs(BaseModel):
     spec: str
+
 
 @tool("make_mermaid", args_schema=MermaidArgs)
 def make_mermaid(spec: str) -> str:
@@ -126,6 +145,7 @@ def make_mermaid(spec: str) -> str:
         spec = spec[:8000] + "\n%% truncated"
     return f"```mermaid\n{spec}\n```"
 
+
 # --------------------------------
 # System prompt for the agent
 # --------------------------------
@@ -138,6 +158,7 @@ CRITICAL RULES:
 - Prefer concise, stepwise, actionable answers; include filenames and symbols when relevant.
 """
 
+
 def _llm_or_none():
     if SETTINGS.has_openai_key:
         # Default to small fast model; user can override via env OPENAI_CHAT_MODEL
@@ -145,6 +166,7 @@ def _llm_or_none():
         temperature = float(os.getenv("OPENAI_TEMPERATURE", "0.1"))
         return ChatOpenAI(model=model, temperature=temperature, timeout=60)
     return None
+
 
 def _agent_graph():
     """Return either a tool-calling LLM agent or a simple retrieval chain fallback."""
@@ -185,33 +207,81 @@ def _agent_graph():
 
     return fallback_run, tools
 
+
+# --------------------------------
+# Intent detection + routing
+# --------------------------------
+def _detect_intent(q: str) -> str:
+    ql = q.lower()
+    if "plugin" in ql and any(w in ql for w in ["name", "names", "list", "what are", "which"]):
+        return "list_plugins"
+    return "rag"  # default: generic RAG answer
+
+
 # --------------------------------
 # Public entrypoint
 # --------------------------------
-def run_langchain_pipeline(query: str, retrieve_fn, k: int = 60, top_n: int = 8) -> Dict[str, Any]:
+def run_langchain_pipeline(
+    query: str,
+    retrieve_fn: Callable[[str, int, int], List[Dict[str, Any]]],
+    k: int = 60,
+    top_n: int = 8,
+) -> Dict[str, Any]:
+    """
+    Orchestrates multiple agents:
+      - InventoryAgent for inventory questions (e.g., 'list plugins')
+      - RAG Agent (your existing retrieve -> synthesize -> package)
+    """
     t0 = time.perf_counter()
-    ctxs = retrieve_fn(query, k=k, top_n=top_n)  # your existing retrieve
-    if not ctxs:
-        return {"decision": "YES", "markdown": "_No relevant results._", "file": ""}
+    run_id = hashlib.sha1(f"{time.time()}-{query}".encode()).hexdigest()[:8]
 
-    md = generate_answer(query, ctxs)
-    if not md:
-        log.warning("Empty LLM output for query=%r", query)
-        return {
-            "decision": "NO",
-            "message": "LLM returned an empty response. Try rephrasing or check logs.",
-            "markdown": "",
-            "file": ""
-        }
+    try:
+        intent = _detect_intent(query)
+        log.info("orchestrator: intent=%s run_id=%s", intent, run_id)
 
-    # Optional: add references and mermaid here as you had before…
-    refs = "\n".join([f"[^{i}] {c.get('path') or c.get('file') or ''}" for i, c in enumerate(ctxs, 1)])
-    md_out = md + ("\n\n---\n**References**\n\n" + refs if refs.strip() else "")
+        # ---------- Inventory route ----------
+        if intent == "list_plugins":
+            inv = run_inventory_agent(query)
+            md = inv.get("markdown", "") or "_No plugins found._"
+            # Package and return a downloadable URL
+            fs_path = _write_md(md, stem=f"answer-{run_id}")
+            file_url = f"/download/{os.path.basename(fs_path)}" if fs_path else ""
+            inv["file"] = file_url
+            log.info("orchestrator: inventory ok run_id=%s duration=%.3fs",
+                     run_id, time.perf_counter() - t0)
+            return inv
 
-    # Write only if non-empty:
-    out_path = _write_md(md_out, stem=hashlib.sha1(query.encode()).hexdigest()[:8])
+        # ---------- Default RAG route ----------
+        ctxs = retrieve_fn(query, k=k, top_n=top_n)  # your adapter maps VDB hits -> {path,text,score}
+        if not ctxs:
+            md = "_No relevant results._"
+            fs_path = _write_md(md, stem=f"answer-{run_id}")
+            file_url = f"/download/{os.path.basename(fs_path)}" if fs_path else ""
+            return {"decision": "YES", "markdown": md, "file": file_url}
 
-    dt = time.perf_counter() - t0
-    log.info("orchestrator: ok run_id=%s duration=%.3fs", os.path.basename(out_path).replace(".md","") if out_path else "-", dt)
+        md = generate_answer(query, ctxs)
+        if not md:
+            log.warning("Empty LLM output for query=%r", query)
+            return {
+                "decision": "NO",
+                "message": "LLM returned an empty response. Try rephrasing or check logs.",
+                "markdown": "",
+                "file": ""
+            }
 
-    return {"decision": "YES", "markdown": md_out, "file": out_path}
+        # Append simple references section
+        refs = "\n".join([f"[^{i}] {c.get('path') or c.get('file') or ''}"
+                          for i, c in enumerate(ctxs, 1)])
+        md_out = md + ("\n\n---\n**References**\n\n" + refs if refs.strip() else "")
+
+        fs_path = _write_md(md_out, stem=f"answer-{run_id}")
+        file_url = f"/download/{os.path.basename(fs_path)}" if fs_path else ""
+
+        dt = time.perf_counter() - t0
+        log.info("orchestrator: ok run_id=%s duration=%.3fs", os.path.basename(fs_path).replace(".md","") if fs_path else "-", dt)
+
+        return {"decision": "YES", "markdown": md_out, "file": file_url}
+
+    except Exception as e:
+        log.exception("orchestrator: failed run_id=%s: %s", run_id, e)
+        return {"decision": "NO", "message": str(e)}
