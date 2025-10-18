@@ -1,7 +1,7 @@
 from __future__ import annotations
 # src/agents/langchain_orchestrator.py
 import functools
-
+import re
 import os, logging, time, hashlib, pathlib
 from typing import List, Dict, Any, Callable
 
@@ -23,7 +23,7 @@ from qdrant_client import QdrantClient
 
 # Existing Inventory agent
 from src.agents.inventory_agent import run as run_inventory_agent
-
+from src.agents.doclink_agent import DocLinkAgent
 # NEW: ElaboratorAgent
 from src.agents.elaborator_agent import ElaboratorAgent, ElaboratorConfig
 
@@ -195,17 +195,72 @@ def _agent_graph():
 
 # ---------- intent ----------
 def _detect_intent(q: str) -> str:
-    ql = q.lower()
-    if "plugin" in ql and any(w in ql for w in ["name", "names", "list", "which", "what are"]):
-        return "list_plugins"
-    return "rag"
+    """
+    Return 'list_plugins' only for queries clearly asking for the names of plugins.
+    Otherwise, fall back to 'rag'.
+    """
+    ql = q.lower().strip()
 
+    # Heuristics that *really* look like "what are the plugin names"
+    plugin_names_patterns = [
+        r"\bnames?\s+of\s+the\s+plugins?\b",
+        r"\bwhat\s+are\s+the\s+plugins?\b",
+        r"\bwhich\s+plugins?\b",
+        r"\blist\s+the\s+plugins?\b",
+        r"\bplugins?\s+list\b",
+    ]
+    if any(re.search(p, ql) for p in plugin_names_patterns):
+        return "list_plugins"
+
+    # If the query is about *a specific* plugin/module/content, stay in RAG.
+    # Examples that should NOT trigger list_plugins:
+    # "list the functions in the plugin HelpfulFunctions"
+    # "what does the HelpfulFunctions plugin do"
+    # "show me modules in JakubAnimNodes"
+    return "rag"
 
 # ---------- public orchestrator ----------
 def _append_refs(md: str, ctxs: List[Dict[str, Any]]) -> str:
     refs = "\n".join([f"[^{i}] {c.get('path') or c.get('file') or ''}"
                       for i, c in enumerate(ctxs, 1)])
     return md + ("\n\n---\n**References**\n\n" + refs if refs.strip() else "")
+
+# --- Model selection & quality gate ---
+def _llm_with(model: str, temperature: float | None = None):
+    t = float(os.getenv("OPENAI_TEMPERATURE", "0.2")) if temperature is None else temperature
+    return ChatOpenAI(model=model, temperature=t, timeout=60)
+
+def _needs_escalation(md: str, expect_citations: bool = True) -> bool:
+    if not md or len(md.strip()) < int(os.getenv("ESCALATE_MIN_CHARS", "280")):
+        return True
+    if expect_citations and "[^" not in md:
+        return True
+    return False
+
+def _synthesize_with_escalation(query: str, contexts: List[Dict[str, Any]]) -> str:
+    """Try fast model first; if weak, retry once with stronger model."""
+    fast_model = os.getenv("OPENAI_CHAT_MODEL", "gpt-4.1-mini")
+    strong_model = os.getenv("OPENAI_STRONG_MODEL", "gpt-4.1")  # set via env to control
+    expect_cites = True
+
+    def _make_chain(llm):
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", "Return clean, concise Markdown. Include citations [^n]."),
+            ("user", "{user_input}"),
+        ])
+        return prompt | llm | StrOutputParser()
+
+    # first pass (fast)
+    md = (_make_chain(_llm_with(fast_model))
+          .invoke({"user_input": _make_prompt(query, contexts)}) or "").strip()
+    if not _needs_escalation(md, expect_cites):
+        return md
+
+    # second pass (strong)
+    md2 = (_make_chain(_llm_with(strong_model))
+           .invoke({"user_input": _make_prompt(query, contexts)}) or "").strip()
+    return md2 or md  # fall back to first if second somehow empty
+
 
 def run_langchain_pipeline(
     query: str,
@@ -299,6 +354,9 @@ def run_langchain_pipeline(
                 log.exception("elaborator failed (inventory): %s", e)
                 md_out = base_md + "\n\n> _(Elaboration step failed; base answer shown.)_"
 
+            ##append any official Unreal docs URLs found in retrieved snippets
+            md_out = DocLinkAgent().add_links(md_out, contexts=[])
+
             fs_path = _write_md(md_out, stem=f"answer-{run_id}")
             file_url = f"/download/{os.path.basename(fs_path)}" if fs_path else ""
             log.info("orchestrator: inventory ok run_id=%s duration=%.3fs",
@@ -315,7 +373,7 @@ def run_langchain_pipeline(
             file_url = f"/download/{os.path.basename(fs_path)}" if fs_path else ""
             return {"decision": "YES", "markdown": md, "file": file_url}
 
-        base_md = generate_answer(query, ctxs)
+        base_md = _synthesize_with_escalation(query, ctxs)
         if not base_md:
             log.warning("Empty LLM output for query=%r", query)
             return {"decision": "NO", "message": "LLM returned empty response.", "markdown": "", "file": ""}
@@ -348,6 +406,10 @@ def run_langchain_pipeline(
 
         # Append references & write file
         md_out = _append_refs(md_out, ctxs)
+
+        #append any official Unreal docs URLs found in retrieved snippets
+        md_out = DocLinkAgent().add_links(md_out, contexts=ctxs)
+
         fs_path = _write_md(md_out, stem=f"answer-{run_id}")
         file_url = f"/download/{os.path.basename(fs_path)}" if fs_path else ""
 
