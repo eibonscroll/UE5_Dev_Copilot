@@ -8,12 +8,12 @@ from .vectordb import VectorDB
 from .indexer import index_all
 from .agents import input_gate, rag_query, responder, formatter
 from pathlib import Path
-from src.agents.pipeline import run_pipeline
+from src.agents.langchain_orchestrator import run_langchain_pipeline
 import os, time, logging, asyncio
-from fastapi import FastAPI, BackgroundTasks, HTTPException, Header
+from fastapi import FastAPI, BackgroundTasks, HTTPException, Header, Body, status
+from fastapi.responses import JSONResponse, HTMLResponse, FileResponse
 from typing import Optional
-from fastapi import HTTPException
-from fastapi.responses import FileResponse
+
 
 
 OUT_DIR = Path("/app/out")  # same dir used by write_markdown()
@@ -77,14 +77,55 @@ def startup():
                 stats.get("files"), stats.get("chunks"), stats.get("elapsed_s"))
     logger.info("startup: finished in %.1fs", time.perf_counter() - t0)
 
+# --- retrieval adapter expected by run_langchain_pipeline(query, retrieve_fn) ---
+def _retrieve_adapter(query: str, k: int = 60, top_n: int = 8):
+    qvec = EMB.embed([query])[0]
+
+    # ✅ remove unsupported kwarg `threshold`
+    hits = VDB.search(qvec, k=k, with_payload=True, with_vectors=False)
+
+    # minimal lexical boost (optional)
+    q_terms = [w.lower() for w in query.split() if len(w) > 3]
+    def boost(text: str) -> int:
+        t = text.lower()
+        return sum(1 for w in q_terms if w in t)
+
+    mapped = []
+    for h in hits:
+        p = h.get("payload", {}) if isinstance(h, dict) else {}
+        text = p.get("text", "") or ""
+        mapped.append({
+            "id": h.get("id"),
+            "score": float(h.get("score", 0.0)) + 0.01 * boost(text),
+            "path": p.get("path") or p.get("file") or "",
+            "source": p.get("source", ""),
+            "text": text,
+        })
+
+    # Optional: filter low scores
+    mapped = [m for m in mapped if m["score"] >= float(os.getenv("RAG_MIN_SCORE", "0"))]
+    mapped.sort(key=lambda r: r["score"], reverse=True)
+    return mapped[:top_n]
+
+# --- your /ask route ---
 @app.post("/ask")
-def ask(q: Ask):
+def ask(body: dict = Body(...)):
+    prompt = (body.get("prompt") or "").strip()
+    logger.info("/ask: prompt=%r", prompt)
+    if not prompt:
+        return JSONResponse({"decision":"NO","message":"Empty prompt"}, status_code=status.HTTP_400_BAD_REQUEST)
+
     try:
-        result = run_pipeline(q.prompt, EMB, VDB)
-        return result
+        result = run_langchain_pipeline(prompt, retrieve_fn=_retrieve_adapter)
+        ok = (result or {}).get("decision") == "YES"
+        md_preview = (result.get("markdown") or "")[:120].replace("\n", " ")
+        logger.info("/ask: decision=%s", result.get("decision"))
+        if not md_preview:
+            logger.warning("/ask: empty markdown returned")
+        return JSONResponse(result, status_code=status.HTTP_200_OK if ok else status.HTTP_200_OK)
     except Exception as e:
         logger.exception("/ask failed: %s", e)
-        return {"decision":"NO", "message": str(e)}
+        return JSONResponse({"decision":"NO","message":str(e)}, status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 @app.post("/ingest")
 def ingest(background: BackgroundTasks):
