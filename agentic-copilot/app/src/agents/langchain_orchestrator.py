@@ -1,5 +1,7 @@
-# src/agents/langchain_orchestrator.py
 from __future__ import annotations
+# src/agents/langchain_orchestrator.py
+import functools
+
 import os, logging, time, hashlib, pathlib
 from typing import List, Dict, Any, Callable
 
@@ -24,6 +26,9 @@ from src.agents.inventory_agent import run as run_inventory_agent
 
 # NEW: ElaboratorAgent
 from src.agents.elaborator_agent import ElaboratorAgent, ElaboratorConfig
+
+# --- Keep a single retriever instance in memory ---
+_RETRIEVER: Any = None
 
 log = logging.getLogger("orchestrator")
 
@@ -75,30 +80,37 @@ def generate_answer(query: str, contexts: List[Dict[str, Any]]) -> str:
 
 # ---------- retriever ----------
 def _embedding_fn(model_name: str):
-    return HuggingFaceEmbeddings(model_name=model_name, encode_kwargs={"normalize_embeddings": True})
+    # Keep it consistent with your index (BAAI/bge-small-en, dim=384)
+    # NOTE: you can switch to langchain-huggingface later; this works now.
+    return HuggingFaceEmbeddings(
+        model_name=model_name,
+        encode_kwargs={"normalize_embeddings": True},
+    )
 
-def _make_retriever() -> Any:
-    # prefer the new packages if you upgrade later, but this works with current deps
+def _build_retriever() -> Any:
     emb = _embedding_fn(SETTINGS.embedding_model)
     client = QdrantClient(
         url=SETTINGS.qdrant_url,
         prefer_grpc=True,
         grpc_port=6334,
-        timeout=60.0,
+        timeout=30.0,  # lower than before so failures don’t feel like a hang
     )
-
-    # 👇 tell LC Qdrant which payload field is the content
     vs = LCQdrant(
         client=client,
         collection_name=SETTINGS.collection,
         embeddings=emb,
-        content_payload_key="text",        # <— your chunks live here
-        metadata_payload_key=None,         # keep full payload in metadata (optional)
+        content_payload_key="text",        # IMPORTANT: your payload uses "text"
+        metadata_payload_key=None,
     )
+    return vs.as_retriever(search_kwargs={"k": 8})
 
-    retriever = vs.as_retriever(search_kwargs={"k": 8})
-    return retriever
-
+def _get_retriever() -> Any:
+    global _RETRIEVER
+    if _RETRIEVER is None:
+        log.info("retriever: building (cold start)")
+        _RETRIEVER = _build_retriever()
+        log.info("retriever: ready")
+    return _RETRIEVER
 
 # ---------- tools ----------
 class SearchArgs(BaseModel):
@@ -113,7 +125,7 @@ def search_docs(query: str, k: int = 8) -> List[Dict[str, Any]]:
       - page_content: the text chunk
       - path/source: a path or module/file hint you can cite in the answer
     """
-    retriever = _make_retriever()
+    retriever = _get_retriever()
     docs = retriever.get_relevant_documents(query, search_kwargs={"k": k})
     out = []
     for d in docs:
@@ -253,7 +265,7 @@ def run_langchain_pipeline(
             items = _extract_items_from_markdown(base_md)
             if not items:
                 # try a direct scan using retriever too (optional)
-                retriever = _make_retriever()
+                retriever = _get_retriever()
                 # probe some results to harvest names from paths
                 docs = retriever.get_relevant_documents("list of plugins", search_kwargs={"k": 12})
                 for d in docs:
@@ -269,7 +281,7 @@ def run_langchain_pipeline(
 
             # Elaborate (plugins)
             try:
-                retriever = _make_retriever()
+                retriever = _get_retriever()
                 from src.agents.elaborator_agent import ElaboratorAgent, ElaboratorConfig
                 elab_cfg = ElaboratorConfig(
                     model=os.getenv("OPENAI_CHAT_MODEL", "gpt-4.1-mini"),
@@ -314,7 +326,7 @@ def run_langchain_pipeline(
             items = _extract_items_from_contexts(ctxs)
 
         try:
-            retriever = _make_retriever()
+            retriever = _get_retriever()
             from src.agents.elaborator_agent import ElaboratorAgent, ElaboratorConfig
             elab_cfg = ElaboratorConfig(
                 model=os.getenv("OPENAI_CHAT_MODEL", "gpt-4.1-mini"),
