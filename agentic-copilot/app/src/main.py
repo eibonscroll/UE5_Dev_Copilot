@@ -205,8 +205,6 @@ def ui():
 
   <!-- Markdown & Mermaid renderers -->
   <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/mermaid/dist/mermaid.min.js"></script>
-  <script>mermaid.initialize({ startOnLoad: false });</script>
 
   <script>
   // ---------- Ask ----------
@@ -251,21 +249,15 @@ def ui():
         return;
       }
       msg.textContent = "";
-      // Render markdown
-      const html = marked.parse(data.markdown || "");
-      out.innerHTML = html;
 
-      // Upgrade any Mermaid code blocks
-      const blocks = out.querySelectorAll('code.language-mermaid, pre code[class*="language-mermaid"]');
-      for (const [i, block] of [...blocks].entries()) {
-        const parent = block.closest('pre') || block.parentElement;
-        const graph = block.textContent;
-        const container = document.createElement('div');
-        container.className = 'mermaid';
-        container.textContent = graph;
-        parent.replaceWith(container);
-      }
-      await mermaid.run({ querySelector: '.mermaid' });
+        // Render markdown
+        const html = marked.parse(data.markdown || "");
+        out.innerHTML = html;
+        
+        // Let the module script convert & render all ```mermaid blocks
+        if (window.renderMermaidBlocks) {
+          await window.renderMermaidBlocks();
+        }
 
       // NEW: enable download if server returned a file path
       if (data.file) {
@@ -372,6 +364,30 @@ def ui():
   refreshStatusBtn.onclick = fetchStatus;
   fetchStatus();
   </script>
+  <!-- Load Mermaid -->
+<script type="module">
+  import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+  // Don’t autostart; we render after markdown hits the DOM
+  mermaid.initialize({ startOnLoad: false, securityLevel: "loose" });
+
+  // Call this after you set innerHTML with the latest markdown
+  window.renderMermaidBlocks = async function () {
+    // Transform fenced ```mermaid code blocks into <div class="mermaid">...</div>
+    document.querySelectorAll('pre > code.language-mermaid').forEach(code => {
+      const pre = code.parentElement;
+      const div = document.createElement('div');
+      div.className = 'mermaid';
+      div.textContent = code.textContent;
+      pre.replaceWith(div);
+    });
+
+    try {
+      await mermaid.run({ querySelector: '.mermaid' });
+    } catch (e) {
+      console.error('Mermaid render error:', e);
+    }
+  };
+</script>
 </body>
 </html>
 """
