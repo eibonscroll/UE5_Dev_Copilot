@@ -1,44 +1,56 @@
 # src/main.py
-from fastapi import FastAPI
-from fastapi.responses import HTMLResponse
+from __future__ import annotations
+
+import logging
+import os
+import time
+from pathlib import Path
+from typing import Optional, List, Dict, Any, Callable
+
+from fastapi import FastAPI, BackgroundTasks, HTTPException, Header, Body, status
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, FileResponse
 from pydantic import BaseModel
+
 from .settings import SETTINGS
 from .embeddings import Embedder
 from .vectordb import VectorDB
 from .indexer import index_all
-from .agents import input_gate, rag_query, responder, formatter
-from pathlib import Path
 from src.agents.langchain_orchestrator import run_langchain_pipeline
-import os, time, logging, asyncio
-from fastapi import FastAPI, BackgroundTasks, HTTPException, Header, Body, status
-from fastapi.responses import JSONResponse, HTMLResponse, FileResponse
-from typing import Optional
 
-
-
-OUT_DIR = Path("/app/out")  # same dir used by write_markdown()
+# -------------------------------------------------
+# App setup (API-only; UI handled by Next.js)
+# -------------------------------------------------
+OUT_DIR = Path("/app/out")
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-logging.basicConfig(
-    level=LOG_LEVEL,
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-)
+logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("app")
 
-app = FastAPI(title="UE Agentic Copilot")
+app = FastAPI(title="UE Agentic Copilot API")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=os.getenv("CORS_ORIGINS", "http://localhost:3000").split(","),
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 EMB = Embedder(os.getenv("EMBEDDING_MODEL", "BAAI/bge-small-en"))
 VDB = VectorDB()
 
+
 class Ask(BaseModel):
     prompt: str
 
+
 def _collection_count() -> int:
-    # small helper to check if collection already has data
     try:
         return VDB.client.count(VDB.collection, exact=True).count
     except Exception:
         return 0
+
 
 @app.on_event("startup")
 def startup():
@@ -46,14 +58,12 @@ def startup():
     policy = os.getenv("INDEX_ON_STARTUP", "auto").lower()
     logger.info("startup: policy=%s collection=%s", policy, VDB.collection)
 
-    # Ensure collection exists with correct dim, but do NOT recreate if it already exists
     dim = getattr(EMB, "dim", 0) or 384
     VDB.ensure_collection(dim=dim, recreate_on_mismatch=True)
 
     existing = _collection_count()
     logger.info("startup: existing points in '%s' = %d", VDB.collection, existing)
 
-    # Decide per policy
     if policy == "never":
         logger.info("startup: skipping indexing (policy=never)")
         return
@@ -61,7 +71,6 @@ def startup():
         logger.info("startup: skipping indexing (policy=auto, collection non-empty)")
         return
 
-    # Otherwise run indexing
     logger.info("startup: starting indexing run…")
     stats = index_all(
         unreal_docs=Path("/ingest/unreal_docs"),
@@ -73,70 +82,98 @@ def startup():
         log_every_files=100,
         log_every_chunks=1000,
     )
-    logger.info("startup: indexing done files=%s chunks=%s in %ss",
-                stats.get("files"), stats.get("chunks"), stats.get("elapsed_s"))
+    logger.info(
+        "startup: indexing done files=%s chunks=%s in %ss",
+        stats.get("files"),
+        stats.get("chunks"),
+        stats.get("elapsed_s"),
+    )
     logger.info("startup: finished in %.1fs", time.perf_counter() - t0)
 
-# --- retrieval adapter expected by run_langchain_pipeline(query, retrieve_fn) ---
-def _retrieve_adapter(query: str, k: int = 60, top_n: int = 8):
-    qvec = EMB.embed([query])[0]
 
-    # ✅ remove unsupported kwarg `threshold`
+# -------------------------------------------------
+# Retrieval adapter for orchestrator
+# -------------------------------------------------
+def _retrieve_adapter(query: str, k: int = 60, top_n: int = 8) -> List[Dict[str, Any]]:
+    qvec = EMB.embed([query])[0]
     hits = VDB.search(qvec, k=k, with_payload=True, with_vectors=False)
 
-    # minimal lexical boost (optional)
     q_terms = [w.lower() for w in query.split() if len(w) > 3]
+
     def boost(text: str) -> int:
-        t = text.lower()
+        t = (text or "").lower()
         return sum(1 for w in q_terms if w in t)
 
-    mapped = []
+    mapped: List[Dict[str, Any]] = []
     for h in hits:
         p = h.get("payload", {}) if isinstance(h, dict) else {}
         text = p.get("text", "") or ""
-        mapped.append({
-            "id": h.get("id"),
-            "score": float(h.get("score", 0.0)) + 0.01 * boost(text),
-            "path": p.get("path") or p.get("file") or "",
-            "source": p.get("source", ""),
-            "text": text,
-        })
+        mapped.append(
+            {
+                "id": h.get("id"),
+                "score": float(h.get("score", 0.0)) + 0.01 * boost(text),
+                "path": p.get("path") or p.get("file") or "",
+                "source": p.get("source", ""),
+                "text": text,
+            }
+        )
 
-    # Optional: filter low scores
-    mapped = [m for m in mapped if m["score"] >= float(os.getenv("RAG_MIN_SCORE", "0"))]
+    min_score = float(os.getenv("RAG_MIN_SCORE", "0"))
+    mapped = [m for m in mapped if m["score"] >= min_score]
     mapped.sort(key=lambda r: r["score"], reverse=True)
     return mapped[:top_n]
 
-# --- your /ask route ---
+
+# -------------------------------------------------
+# Public API
+# -------------------------------------------------
+@app.get("/health")
+def health():
+    return {"ok": True}
+
+
 @app.post("/ask")
 def ask(body: dict = Body(...)):
     prompt = (body.get("prompt") or "").strip()
     logger.info("/ask: prompt=%r", prompt)
     if not prompt:
-        return JSONResponse({"decision":"NO","message":"Empty prompt"}, status_code=status.HTTP_400_BAD_REQUEST)
+        return JSONResponse(
+            {"decision": "NO", "message": "Empty prompt"},
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
 
     try:
         result = run_langchain_pipeline(prompt, retrieve_fn=_retrieve_adapter)
         ok = (result or {}).get("decision") == "YES"
-        md_preview = (result.get("markdown") or "")[:120].replace("\n", " ")
-        logger.info("/ask: decision=%s", result.get("decision"))
-        if not md_preview:
+        if not (result.get("markdown") or ""):
             logger.warning("/ask: empty markdown returned")
         return JSONResponse(result, status_code=status.HTTP_200_OK if ok else status.HTTP_200_OK)
     except Exception as e:
         logger.exception("/ask failed: %s", e)
-        return JSONResponse({"decision":"NO","message":str(e)}, status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        return JSONResponse({"decision": "NO", "message": str(e)}, status_code=500)
+
 
 @app.post("/ingest")
 def ingest(background: BackgroundTasks):
-    background.add_task(index_all, Path("/ingest/unreal_docs"), Path("/ingest/project"),
-                        Path("/ingest/plugins"), EMB, VDB,
-                        logging.getLogger("indexer"), 100, 1000)
+    """
+    Trigger a full re-index in the background.
+    """
+    background.add_task(
+        index_all,
+        Path("/ingest/unreal_docs"),
+        Path("/ingest/project"),
+        Path("/ingest/plugins"),
+        EMB,
+        VDB,
+        logging.getLogger("indexer"),
+        100,
+        1000,
+    )
     return {"status": "started"}
+
 
 @app.get("/download/{name}")
 def download_md(name: str):
-    # block path traversal
     if "/" in name or "\\" in name:
         raise HTTPException(status_code=400, detail="Invalid filename")
     path = OUT_DIR / name
@@ -144,256 +181,10 @@ def download_md(name: str):
         raise HTTPException(status_code=404, detail="File not found")
     return FileResponse(str(path), media_type="text/markdown", filename=name)
 
-@app.get("/", response_class=HTMLResponse)
-def ui():
-    return r"""
-<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8" />
-  <title>UE Agentic Copilot (Local)</title>
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <style>
-    :root { color-scheme: light dark; }
-    body { font-family: system-ui, sans-serif; margin: 1.25rem 1.25rem 4rem; line-height:1.4; }
-    textarea { width: 100%; height: 10rem; font-family: ui-monospace, monospace; }
-    button { padding: .55rem .9rem; margin-top: .5rem; border-radius:.45rem; cursor:pointer; }
-    .row { display:flex; gap:.75rem; align-items:center; flex-wrap:wrap; }
-    .muted { opacity:.7; font-size:.9rem; }
-    #out { margin-top: 1.25rem; }
-    pre { background:#111; color:#eee; padding:1rem; overflow:auto; border-radius:.5rem; }
-    .panel { border:1px solid #9993; padding:.75rem; border-radius:.5rem; }
-    .ok { color: #0a0; }
-    .warn { color: #b80; }
-    .err { color: #c00; }
-    .kbd { font: 12px ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; background: #0003; padding: .15rem .35rem; border-radius: .25rem; }
-  </style>
-</head>
-<body>
-  <h1>UE Agentic Copilot</h1>
-  <p class="muted">Tip: Open <a href="/docs" target="_blank">/docs</a> for the API.</p>
 
-  <!-- Ask UI -->
-  <section class="panel" style="margin-bottom:1rem;">
-    <h3 style="margin:0 0 .25rem;">Ask</h3>
-    <p>Enter a prompt related to Unreal docs, your game project, or plugins.</p>
-    <textarea id="prompt" placeholder="e.g., Where does PlayerController spawn the companion actor?"></textarea><br/>
-    <div class="row">
-      <button id="ask">Ask</button>
-      <!-- NEW: download -->
-      <button id="downloadBtn" disabled title="Download last answer as .md">Download .md</button>
-      <span id="dlInfo" class="muted"></span>
-      <!-- /NEW -->
-      <span id="msg" class="muted"></span>
-    </div>
-    <div id="out"></div>
-  </section>
-
-  <!-- Admin: Reindex -->
-  <section class="panel">
-    <h3 style="margin:0 0 .25rem;">Admin</h3>
-    <div class="row">
-      <button id="reindexBtn">Reindex</button>
-      <button id="refreshStatusBtn" title="Refresh status">Refresh</button>
-      <label class="muted">Token:
-        <input id="token" type="password" placeholder="optional X-Token" style="padding:.35rem;"/>
-      </label>
-      <span id="reindexMsg" class="muted"></span>
-    </div>
-    <pre id="status" style="margin-top:.6rem; max-height:18rem;"></pre>
-  </section>
-
-  <!-- Markdown & Mermaid renderers -->
-  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
-
-  <script>
-  // ---------- Ask ----------
-  const askBtn = document.getElementById('ask');
-  const promptEl = document.getElementById('prompt');
-  const out = document.getElementById('out');
-  const msg = document.getElementById('msg');
-  // NEW: download controls
-  const downloadBtn = document.getElementById('downloadBtn');
-  const dlInfo = document.getElementById('dlInfo');
-  let lastFileName = null; // just the basename
-  // /NEW
-
-  function basename(p) {
-    if (!p) return "";
-    return p.split('/').pop().split('\\').pop();
-  }
-
-  askBtn.onclick = async () => {
-    const q = (promptEl.value || "").trim();
-    if (!q) { msg.textContent = "Enter a prompt."; return; }
-    msg.textContent = "Running…";
-    out.innerHTML = "";
-    // reset download UI
-    lastFileName = null;
-    downloadBtn.disabled = true;
-    dlInfo.textContent = "";
-
-    try {
-      const r = await fetch('/ask', {
-        method: 'POST',
-        headers: {'Content-Type':'application/json'},
-        body: JSON.stringify({ prompt: q })
-      });
-      if (!r.ok) {
-        const text = await r.text();
-        throw new Error("HTTP " + r.status + ": " + text);
-      }
-      const data = await r.json();
-      if (data.decision && data.decision !== "YES") {
-        msg.textContent = "Out of bounds: " + (data.message || "");
-        return;
-      }
-      msg.textContent = "";
-
-        // Render markdown
-        const html = marked.parse(data.markdown || "");
-        out.innerHTML = html;
-        
-        // Let the module script convert & render all ```mermaid blocks
-        if (window.renderMermaidBlocks) {
-          await window.renderMermaidBlocks();
-        }
-
-      // NEW: enable download if server returned a file path
-      if (data.file) {
-        lastFileName = basename(data.file);
-        if (lastFileName) {
-          downloadBtn.disabled = false;
-          dlInfo.textContent = "Ready: " + lastFileName;
-        }
-      }
-      // /NEW
-    } catch (e) {
-      console.error(e);
-      msg.textContent = "Error: " + e.message;
-    }
-  };
-
-  // NEW: download click handler
-  downloadBtn.onclick = () => {
-    if (!lastFileName) return;
-    const url = '/download/' + encodeURIComponent(lastFileName);
-    // trigger browser download
-    window.location.href = url;
-  };
-  // /NEW
-
-  // ---------- Admin: Reindex ----------
-  const tokenInput = document.getElementById('token');
-  const reindexBtn = document.getElementById('reindexBtn');
-  const refreshStatusBtn = document.getElementById('refreshStatusBtn');
-  const statusPre = document.getElementById('status');
-  const reindexMsg = document.getElementById('reindexMsg');
-
-  // Persist token locally (optional)
-  tokenInput.value = localStorage.getItem('reindex_token') || "";
-  tokenInput.addEventListener('change', () => {
-    localStorage.setItem('reindex_token', tokenInput.value || "");
-  });
-
-  let pollTimer = null;
-
-  function hdrs() {
-    const h = { };
-    const t = tokenInput.value.trim();
-    if (t) h['X-Token'] = t;
-    return h;
-  }
-
-  async function fetchStatus() {
-    try {
-      const r = await fetch('/admin/reindex/status', { headers: hdrs() });
-      if (!r.ok) throw new Error("HTTP " + r.status);
-      const j = await r.json();
-      statusPre.textContent = JSON.stringify(j, null, 2);
-
-      if (j.running) {
-        reindexBtn.disabled = true;
-        reindexBtn.textContent = "Reindex (running…)";
-        if (!pollTimer) pollTimer = setTimeout(fetchStatus, 1000);
-      } else {
-        reindexBtn.disabled = false;
-        reindexBtn.textContent = "Reindex";
-        if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
-      }
-
-      if (j.last_error) {
-        reindexMsg.textContent = "Last error: " + j.last_error;
-        reindexMsg.className = "err";
-      } else if (j.last_stats && j.last_stats.chunks) {
-        reindexMsg.textContent = "Last run: " + j.last_stats.chunks + " chunks";
-        reindexMsg.className = "ok";
-      } else {
-        reindexMsg.textContent = "";
-        reindexMsg.className = "muted";
-      }
-    } catch (e) {
-      statusPre.textContent = "Status error: " + e.message;
-      reindexBtn.disabled = false;
-      reindexBtn.textContent = "Reindex";
-      if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
-    }
-  }
-
-  async function triggerReindex() {
-    try {
-      reindexBtn.disabled = true;
-      reindexBtn.textContent = "Reindex (starting…)";
-      reindexMsg.textContent = "Starting…";
-      const r = await fetch('/admin/reindex', { method: 'POST', headers: hdrs() });
-      if (!r.ok) {
-        const t = await r.text();
-        throw new Error("HTTP " + r.status + ": " + t);
-      }
-      reindexMsg.textContent = "Reindex started.";
-      fetchStatus();
-    } catch (e) {
-      reindexMsg.textContent = "Start failed: " + e.message;
-      reindexMsg.className = "err";
-      reindexBtn.disabled = false;
-      reindexBtn.textContent = "Reindex";
-    }
-  }
-
-  reindexBtn.onclick = triggerReindex;
-  refreshStatusBtn.onclick = fetchStatus;
-  fetchStatus();
-  </script>
-  <!-- Load Mermaid -->
-<script type="module">
-  import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
-  // Don’t autostart; we render after markdown hits the DOM
-  mermaid.initialize({ startOnLoad: false, securityLevel: "loose" });
-
-  // Call this after you set innerHTML with the latest markdown
-  window.renderMermaidBlocks = async function () {
-    // Transform fenced ```mermaid code blocks into <div class="mermaid">...</div>
-    document.querySelectorAll('pre > code.language-mermaid').forEach(code => {
-      const pre = code.parentElement;
-      const div = document.createElement('div');
-      div.className = 'mermaid';
-      div.textContent = code.textContent;
-      pre.replaceWith(div);
-    });
-
-    try {
-      await mermaid.run({ querySelector: '.mermaid' });
-    } catch (e) {
-      console.error('Mermaid render error:', e);
-    }
-  };
-</script>
-</body>
-</html>
-"""
-
-
-# simple in-memory state
+# -------------------------------------------------
+# Admin: reindex with token guard
+# -------------------------------------------------
 class ReindexState:
     running: bool = False
     last_started: float | None = None
@@ -401,14 +192,23 @@ class ReindexState:
     last_stats: dict | None = None
     last_error: str | None = None
 
+
 STATE = ReindexState()
 
-async def _reindex_task():
+
+def _require_token(x_token: Optional[str]):
+    expected = os.getenv("REINDEX_TOKEN")
+    if not expected:
+        return
+    if not x_token or x_token != expected:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+
+def _reindex_task_sync():
     STATE.running = True
     STATE.last_error = None
     STATE.last_started = time.time()
     try:
-        from .indexer import index_all
         stats = index_all(
             unreal_docs=Path("/ingest/unreal_docs"),
             project=Path("/ingest/project"),
@@ -427,21 +227,15 @@ async def _reindex_task():
         STATE.last_finished = time.time()
         STATE.running = False
 
-def _require_token(x_token: Optional[str]):
-    expected = os.getenv("REINDEX_TOKEN")
-    if not expected:
-        return  # no guard set
-    if not x_token or x_token != expected:
-        raise HTTPException(status_code=401, detail="Invalid token")
 
 @app.post("/admin/reindex")
-async def trigger_reindex(background: BackgroundTasks, x_token: Optional[str] = Header(None)):
+def trigger_reindex(background: BackgroundTasks, x_token: Optional[str] = Header(None)):
     _require_token(x_token)
     if STATE.running:
         raise HTTPException(status_code=409, detail="Reindex already running")
-    # fire-and-forget background task
-    background.add_task(lambda: asyncio.run(_reindex_task()))
+    background.add_task(_reindex_task_sync)
     return {"status": "started"}
+
 
 @app.get("/admin/reindex/status")
 def reindex_status(x_token: Optional[str] = Header(None)):

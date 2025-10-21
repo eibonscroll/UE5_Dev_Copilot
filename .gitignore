@@ -240,3 +240,19 @@ __marimo__/
 
 # Ignore genereated responses
 out/
+
+# Node / JS
+node_modules/
+**/node_modules/
+
+# Next.js / web build outputs
+.next/
+**/.next/
+out/
+**/out/
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
