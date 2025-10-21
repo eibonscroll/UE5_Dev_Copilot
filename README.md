@@ -12,33 +12,68 @@ The orchestrator coordinates multiple **domain-specific agents** — from retrie
 ## 📁 Project Structure
 ```
 agentic-copilot/
+.
+├─ .env
+├─ .env.example
 ├─ docker-compose.yml
+├─ project_snapshot.md
 ├─ app/
-│ ├─ Dockerfile
-│ ├─ requirements.txt
-│ └─ src/
-│ ├─ main.py
-│ ├─ settings.py
-│ ├─ vectordb.py
-│ ├─ embeddings.py
-│ ├─ indexer.py
-│ ├─ memory_store.py
-│ ├─ agents/
-│ │ ├─ langchain_orchestrator.py
-│ │ ├─ input_gate.py
-│ │ ├─ rag_query.py
-│ │ ├─ responder.py
-│ │ ├─ formatter.py
-│ │ ├─ inventory_agent.py
-│ │ ├─ elaborator_agent.py
-│ │ └─ doclink_agent.py
-│ └─ utils/
-│ ├─ logging_utils.py
-│ └─ constants.py
-└─ data/
+│  ├─ .dockerignore
+│  ├─ Dockerfile
+│  ├─ pytest.ini
+│  ├─ requirements.txt
+│  ├─ src/
+│  │  ├─ embeddings.py
+│  │  ├─ indexer.py
+│  │  ├─ main.py
+│  │  ├─ memory_store.py
+│  │  ├─ rerank.py
+│  │  ├─ settings.py
+│  │  ├─ vectordb.py
+│  │  ├─ __init__.py
+│  │  ├─ agents/
+│  │  │  ├─ doclink_agent.py
+│  │  │  ├─ elaborator_agent.py
+│  │  │  ├─ formatter.py
+│  │  │  ├─ input_gate.py
+│  │  │  ├─ inventory_agent.py
+│  │  │  ├─ langchain_orchestrator.py
+│  │  │  ├─ rag_query.py
+│  │  │  ├─ responder.py
+│  │  │  └─ __init__.py
+│  │  └─ utils/
+│  │     ├─ code_parsing.py
+│  │     ├─ filters.py
+│  │     └─ __init__.py
+│  └─ tests/
+│     ├─ conftest.py
+│     ├─ test_app_endpoint.py
+│     ├─ test_doclink_agent.py
+│     ├─ test_elaborator.py
+│     ├─ test_integration_smoke.py
+│     ├─ test_orchestrator_inventory.py
+│     ├─ test_orchestrator_rag.py
+│     └─ test_write_md_errors.py
+├─ data/
 ├─ ingest/
 ├─ out/
-└─ qdrant/
+├─ storage/
+│  ├─ .qdrant_fs_check
+│  ├─ raft_state.json
+│  ├─ aliases/
+│  │  └─ data.json
+│  └─ collections/
+└─ web/
+   ├─ .dockerignore
+   ├─ Dockerfile
+   ├─ next.config.js
+   ├─ package.json
+   ├─ server.js
+   ├─ lib/
+   │  └─ api.ts
+   └─ pages/
+      └─ index.tsx
+
 ```
 
 
@@ -54,6 +89,7 @@ agentic-copilot/
 | Embeddings | **HuggingFace - BAAI/bge-small-en** | 384-dimension document embeddings |
 | LLM | **OpenAI GPT-4.1-mini / GPT-4.1-turbo** | Language reasoning and elaboration |
 | API/Frontend | **FastAPI** or **Streamlit UI** | User query interface and web app |
+| Web UI | **Next.js 14.2.5 (React 18.2.0)** | SSR/SSG React front-end for the application |
 | DevOps | **Docker Compose**, **uvicorn** | Containerized multi-service deployment |
 | Testing | **pytest** | Automated test execution for agents and orchestration |
 
