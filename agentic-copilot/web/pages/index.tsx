@@ -19,6 +19,7 @@ export default function Home() {
         onSubmit={ask.ask}
         loading={ask.loading}
         error={ask.error}
+        downloadPath={ask.downloadPath}
       />
 
       <ResponseConsole

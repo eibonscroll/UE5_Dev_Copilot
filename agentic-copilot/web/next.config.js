@@ -9,6 +9,7 @@ const nextConfig = {
   async rewrites() {
     return [
       { source: '/api/:path*', destination: 'http://app:8080/:path*' },
+      { source: "/download/:path*", destination: "http://app:8080/download/:path*" },
     ];
   },
 

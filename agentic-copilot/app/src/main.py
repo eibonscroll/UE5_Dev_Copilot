@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import logging
 import os
-import time
+import time, uuid
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Callable
 
@@ -50,6 +50,39 @@ def _collection_count() -> int:
         return VDB.client.count(VDB.collection, exact=True).count
     except Exception:
         return 0
+
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    rid = request.headers.get("x-request-id") or uuid.uuid4().hex[:8]
+    start = time.perf_counter()
+
+    # helpful: don’t log the whole prompt, just sizes
+    try:
+        if request.method == "POST":
+            body = await request.body()
+            req_size = len(body or b"")
+        else:
+            req_size = 0
+    except Exception:
+        req_size = -1
+
+    try:
+        response = await call_next(request)
+    except Exception as e:
+        dt = (time.perf_counter() - start) * 1000
+        log.exception("HTTP %s %s -> 500 rid=%s dt=%.1fms req=%dB",
+                      request.method, request.url.path, rid, dt, req_size)
+        return JSONResponse(
+            {"error": "internal_error", "detail": str(e), "rid": rid},
+            status_code=500
+        )
+
+    dt = (time.perf_counter() - start) * 1000
+    logger.info("HTTP %s %s -> %s rid=%s dt=%.1fms req=%dB",
+             request.method, request.url.path, response.status_code, rid, dt, req_size)
+    # propagate the ID so FE can show it
+    response.headers["x-request-id"] = rid
+    return response
 
 
 @app.on_event("startup")
