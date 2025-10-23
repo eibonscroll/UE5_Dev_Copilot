@@ -1,6 +1,6 @@
 // web/hooks/useAsk.ts
 import { useCallback, useRef, useState } from "react";
-import { ask as askApi } from "../lib/api";
+import { v4 as uuidv4 } from "uuid";
 
 function toDownloadHref(filePath?: string | null) {
   if (!filePath) return null;
@@ -9,20 +9,30 @@ function toDownloadHref(filePath?: string | null) {
   return `${root}${filePath}`;                             // -> "/download/answer-xxxx.md"
 }
 
-export function useAsk() {
-  const [prompt, setPrompt] = useState("");
+export function useAsk(
+  onSaved?: (item: {
+    id: string;
+    ts: number;
+    prompt: string;
+    markdown?: string;
+    raw?: any;
+    file?: string | null;
+  }) => void
+) {
+  // Rename to avoid clashing with global window.prompt()
+  const [input, setInput] = useState<string>("");
+
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [raw, setRaw] = useState<any>(null);
-  const [markdown, setMarkdown] = useState("");
+  const [markdown, setMarkdown] = useState<string>("");
   const [logs, setLogs] = useState<string[]>([]);
+  const [file, setFile] = useState<string | null>(null);
+
+  const downloadPath = toDownloadHref(file);
 
   // Expose marked function to children that render markdown
   const markedRef = useRef<any>(null);
-
-  // track file + computed download URL
-  const [file, setFile] = useState<string | null>(null);
-  const downloadPath = toDownloadHref(file);
 
   const log = (s: string) =>
     setLogs((prev) => [...prev, `[${new Date().toLocaleTimeString()}] ${s}`]);
@@ -37,32 +47,29 @@ export function useAsk() {
   }, []);
 
   const ask = useCallback(async () => {
-    if (!prompt.trim()) return;
+    if (!input.trim()) return;
+
     setLoading(true);
     setError(null);
     setRaw(null);
     setMarkdown("");
     setLogs([]);
+    setFile(null);
 
     const t0 = performance.now();
     try {
       await ensureMarked();
       const base = process.env.NEXT_PUBLIC_API_BASE || "/api";
 
-      //Clear file
-      setFile(null);
-
       log(`POST ${base}/ask`);
       const res = await fetch(`${base}/ask`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ prompt }),
+        body: JSON.stringify({ prompt: input }),
       });
 
       log(`HTTP ${res.status}`);
       const json = await res.json().catch(() => ({}));
-      // set download file if present
-      setFile(json?.file ?? null);
       setRaw(json);
 
       if (!res.ok || json.decision === "NO") {
@@ -70,7 +77,21 @@ export function useAsk() {
         setError(msg);
         log(`Backend error: ${msg}`);
       } else {
-        setMarkdown(json.markdown || "");
+        const md = json.markdown || "";
+        const f = json.file || null;
+        setMarkdown(md);
+        setFile(f);
+        log("Received markdown + file");
+
+        // Save to history (if caller provided a sink)
+        onSaved?.({
+          id: uuidv4(),
+          ts: Date.now(),
+          prompt: input,
+          markdown: md,
+          raw: json,
+          file: f,
+        });
       }
     } catch (e: any) {
       const msg = e?.message || String(e);
@@ -80,17 +101,20 @@ export function useAsk() {
       log(`Done in ${(performance.now() - t0).toFixed(0)}ms`);
       setLoading(false);
     }
-  }, [prompt, ensureMarked]);
+  }, [input, ensureMarked, onSaved]);
 
   return {
-    prompt,
-    setPrompt,
+    // keep external API names the same:
+    prompt: input,
+    setPrompt: setInput,
+
     loading,
     error,
     raw,
     markdown,
     logs,
     marked: markedRef.current,
+
     ask,
     downloadPath,
   };
